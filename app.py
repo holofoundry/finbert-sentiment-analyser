@@ -1,10 +1,11 @@
+# app.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Union, Dict, Any, Optional
 
 from sentiment_service import FinBertSentimentService
 
-app = FastAPI(title="FinBERT Sentiment API", version="1.0.0")
+app = FastAPI(title="FinBERT Sentiment API", version="1.1.0")
 
 # Load once, keep warm
 service: Optional[FinBertSentimentService] = None
@@ -19,7 +20,28 @@ class SentimentRequest(BaseModel):
             ["Good earnings.", "Bad guidance."],
         ],
     )
-    max_length: int = Field(128, ge=16, le=512, description="Tokenizer max_length")
+
+    # Kept for backwards compatibility with your existing client calls.
+    # Chunking now controls effective length; tokenizer truncation is only a safety net.
+    max_length: int = Field(128, ge=16, le=512, description="Legacy tokenizer max_length (compat)")
+
+    # New explicit chunking controls
+    chunk_tokens: int = Field(
+        450,
+        ge=64,
+        le=510,
+        description="Token window size (content tokens) for chunking",
+    )
+    overlap_tokens: int = Field(
+        50,
+        ge=0,
+        le=256,
+        description="Token overlap between chunks",
+    )
+    return_chunk_results: bool = Field(
+        False,
+        description="Include per-chunk scores in the response",
+    )
 
 
 class SentimentResponse(BaseModel):
@@ -45,25 +67,34 @@ def sentiment(req: SentimentRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     # Normalize and validate input
-    if isinstance(req.text, list):
-        texts = req.text
-    else:
-        texts = [req.text]
+    texts = req.text if isinstance(req.text, list) else [req.text]
 
     if any((t is None or not str(t).strip()) for t in texts):
         raise HTTPException(status_code=400, detail="All texts must be non-empty strings")
 
-    # Use batch inference when multiple texts are provided
+    if req.overlap_tokens >= req.chunk_tokens:
+        raise HTTPException(status_code=400, detail="overlap_tokens must be less than chunk_tokens")
+
+    # Single item path
     if len(texts) == 1:
-        result = service.analyze_one(texts[0], max_length=req.max_length)
+        result = service.analyze_one(
+            texts[0],
+            max_length=req.max_length,
+            chunk_tokens=req.chunk_tokens,
+            overlap_tokens=req.overlap_tokens,
+            return_chunk_results=req.return_chunk_results,
+        )
         return {"results": [result]}
 
-    # analyze_batch returns either a list of dicts or a wrapped batch payload,
-    # depending on how you implemented it. The common/clean approach is a list.
-    batch_results = service.analyze_batch(texts, max_length=req.max_length)
+    # Batch path (service returns wrapper; keep your existing unwrap logic)
+    batch_results = service.analyze_batch(
+        texts,
+        max_length=req.max_length,
+        chunk_tokens=req.chunk_tokens,
+        overlap_tokens=req.overlap_tokens,
+        return_chunk_results=req.return_chunk_results,
+    )
 
-    # If your analyze_batch returns a wrapper like [{"batch_size":..., "items":[...]}],
-    # unwrap it so the API response matches SentimentResponse (list of dicts).
     if (
         isinstance(batch_results, list)
         and len(batch_results) == 1
