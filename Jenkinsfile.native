@@ -25,7 +25,7 @@ pipeline {
         string(
             name: 'DEPLOY_PATH',
             defaultValue: '/opt/finbert',
-            description: 'Root deployment directory on the remote host. The repo is cloned into DEPLOY_PATH/finbert-sentiment-analyser.'
+            description: 'Root deployment directory on the remote host. Repo cloned into DEPLOY_PATH/finbert-sentiment-analyser.'
         )
         string(
             name: 'SSH_CREDENTIALS_ID',
@@ -45,21 +45,17 @@ pipeline {
     }
 
     environment {
-        REPOSITORY_URL  = 'https://github.com/holofoundry/finbert-sentiment-analyser.git'
-        PYTHON_VERSION  = '3.11.15'
-        SERVICE_NAME    = 'finbert'
-        SERVICE_USER    = 'finbert'
-        SERVICE_GROUP   = 'finbert'
+        REPOSITORY_URL = 'https://github.com/holofoundry/finbert-sentiment-analyser.git'
+        PYTHON_VERSION = '3.11.15'
+        SERVICE_NAME   = 'finbert'
+        SERVICE_USER   = 'finbert'
+        SERVICE_GROUP  = 'finbert'
     }
 
     stages {
 
         // ------------------------------------------------------------------ //
         stage('Checkout') {
-        // ------------------------------------------------------------------ //
-        // Pull the source locally so we can validate the branch exists and
-        // copy any local-only config artefacts to the server if needed in
-        // future stages.
         // ------------------------------------------------------------------ //
             steps {
                 script {
@@ -75,27 +71,254 @@ pipeline {
         // ------------------------------------------------------------------ //
         stage('Prepare') {
         // ------------------------------------------------------------------ //
-        // Resolve all parameters into environment variables used by later
-        // stages so every shell block reads from a single source of truth.
+        // Resolve parameters and write all remote shell scripts into the
+        // Jenkins workspace.  Scripts are scp'd and executed in later stages —
+        // no complex SSH heredocs needed.
         // ------------------------------------------------------------------ //
             steps {
                 script {
-                    env.DEPLOY_WEB_HOST        = params.DEPLOY_HOST?.trim()     ?: '100.102.25.32'
-                    env.DEPLOY_REMOTE_ROOT     = params.DEPLOY_PATH?.trim()     ?: '/opt/finbert'
-                    env.DEPLOY_SSH_CREDS_ID    = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
-                    env.DEPLOY_SERVICE_PORT    = params.SERVICE_PORT?.trim()    ?: '8000'
+                    env.DEPLOY_WEB_HOST        = params.DEPLOY_HOST?.trim()          ?: '100.102.25.32'
+                    env.DEPLOY_REMOTE_ROOT     = params.DEPLOY_PATH?.trim()          ?: '/opt/finbert'
+                    env.DEPLOY_SSH_CREDS_ID    = params.SSH_CREDENTIALS_ID?.trim()   ?: 'jetson-deployment-key'
+                    env.DEPLOY_SERVICE_PORT    = params.SERVICE_PORT?.trim()         ?: '8000'
                     env.DEPLOY_APP_DIR         = "${env.DEPLOY_REMOTE_ROOT}/finbert-sentiment-analyser"
                     env.DEPLOY_VENV_DIR        = "${env.DEPLOY_APP_DIR}/.venv"
                     env.DEPLOY_FORCE_REINSTALL = params.FORCE_REINSTALL ? 'true' : 'false'
+
+                    sh 'mkdir -p remote-scripts'
+
+                    // ── Script 1: Bootstrap pyenv + Python 3.11 ───────────
+                    writeFile file: 'remote-scripts/01_bootstrap.sh', text: '''#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== [bootstrap] Installing system build dependencies ==="
+sudo apt-get update -qq
+sudo apt-get install -y -qq \
+    build-essential curl git \
+    libssl-dev zlib1g-dev libbz2-dev \
+    libreadline-dev libsqlite3-dev libncursesw5-dev \
+    xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+    libffi-dev liblzma-dev ca-certificates
+
+echo "=== [bootstrap] Checking pyenv ==="
+PYENV_ROOT_DIR="$HOME/.pyenv"
+if [ ! -d "$PYENV_ROOT_DIR" ]; then
+    echo "[bootstrap] Installing pyenv..."
+    curl -fsSL https://pyenv.run | bash
+else
+    echo "[bootstrap] pyenv already present at $PYENV_ROOT_DIR"
+fi
+
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - bash)"
+
+echo "=== [bootstrap] Ensuring pyenv is in .bashrc ==="
+PROFILE="$HOME/.bashrc"
+if ! grep -q "pyenv init" "$PROFILE" 2>/dev/null; then
+    echo "[bootstrap] Adding pyenv block to $PROFILE..."
+    printf "\\n# pyenv - added by finbert Jenkins deploy\\n"          >> "$PROFILE"
+    printf 'export PYENV_ROOT="$HOME/.pyenv"\\n'                      >> "$PROFILE"
+    printf 'export PATH="$PYENV_ROOT/bin:$PATH"\\n'                   >> "$PROFILE"
+    printf 'eval "$(pyenv init - bash)"\\n'                           >> "$PROFILE"
+else
+    echo "[bootstrap] pyenv already in $PROFILE"
+fi
+
+echo "=== [bootstrap] Checking Python $PYENV_VERSION ==="
+if pyenv versions --bare 2>/dev/null | grep -qx "$PYENV_VERSION"; then
+    echo "[bootstrap] Python $PYENV_VERSION already installed."
+else
+    echo "[bootstrap] Installing Python $PYENV_VERSION (may take several minutes)..."
+    pyenv install "$PYENV_VERSION"
+    echo "[bootstrap] Python $PYENV_VERSION installed."
+fi
+
+echo "=== [bootstrap] Complete ==="
+'''
+
+                    // ── Script 2: Clone / update repo ─────────────────────
+                    // REPO_URL is injected at runtime (contains credentials)
+                    writeFile file: 'remote-scripts/02_clone.sh', text: '''#!/usr/bin/env bash
+set -euo pipefail
+
+: "${DEPLOY_ROOT:?DEPLOY_ROOT must be set}"
+: "${APP_DIR:?APP_DIR must be set}"
+: "${BRANCH:?BRANCH must be set}"
+: "${REPO_URL:?REPO_URL must be set}"
+: "${SVC_USER:?SVC_USER must be set}"
+: "${SVC_GROUP:?SVC_GROUP must be set}"
+
+echo "=== [clone] Ensuring deploy root $DEPLOY_ROOT exists ==="
+sudo mkdir -p "$DEPLOY_ROOT"
+
+if ! id "$SVC_USER" &>/dev/null; then
+    echo "[clone] Creating system user $SVC_USER..."
+    sudo useradd --system --home "$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SVC_USER"
+fi
+sudo chown -R "$SVC_USER":"$SVC_GROUP" "$DEPLOY_ROOT"
+
+echo "=== [clone] Clone / update repo ==="
+if [ -d "$APP_DIR/.git" ]; then
+    echo "[clone] Repo exists — fetching latest..."
+    sudo -u "$SVC_USER" git -C "$APP_DIR" remote set-url origin "$REPO_URL"
+    sudo -u "$SVC_USER" git -C "$APP_DIR" fetch --prune origin
+    sudo -u "$SVC_USER" git -C "$APP_DIR" checkout "$BRANCH"
+    sudo -u "$SVC_USER" git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+else
+    echo "[clone] Fresh clone into $APP_DIR..."
+    sudo -u "$SVC_USER" git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+fi
+
+echo "=== [clone] Repo at branch $BRANCH is ready ==="
+'''
+
+                    // ── Script 3: Virtual environment + dependencies ───────
+                    writeFile file: 'remote-scripts/03_venv.sh', text: '''#!/usr/bin/env bash
+set -euo pipefail
+
+: "${APP_DIR:?APP_DIR must be set}"
+: "${VENV_DIR:?VENV_DIR must be set}"
+: "${PYENV_VERSION:?PYENV_VERSION must be set}"
+: "${FORCE_REINSTALL:?FORCE_REINSTALL must be set}"
+: "${SVC_USER:?SVC_USER must be set}"
+
+PYENV_PYTHON="$HOME/.pyenv/versions/$PYENV_VERSION/bin/python3.11"
+
+echo "=== [venv] Locating Python binary ==="
+if [ ! -f "$PYENV_PYTHON" ]; then
+    echo "[venv] ERROR: Expected binary not found at $PYENV_PYTHON"
+    echo "[venv] Run Bootstrap stage first."
+    exit 1
+fi
+echo "[venv] Using: $PYENV_PYTHON"
+
+if [ "$FORCE_REINSTALL" = "true" ] && [ -d "$VENV_DIR" ]; then
+    echo "[venv] FORCE_REINSTALL=true — removing $VENV_DIR..."
+    sudo rm -rf "$VENV_DIR"
+fi
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo "=== [venv] Creating virtual environment ==="
+    sudo -u "$SVC_USER" "$PYENV_PYTHON" -m venv "$VENV_DIR"
+fi
+
+echo "=== [venv] Upgrading pip toolchain ==="
+sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
+
+echo "=== [venv] Installing application dependencies ==="
+# torch is intentionally omitted — the Jetson has a GPU-optimised build
+# pre-installed. Installing via pip would overwrite it with a CPU-only wheel.
+sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install \
+    fastapi "uvicorn[standard]" pydantic \
+    transformers safetensors \
+    scikit-learn numpy pandas
+
+if [ -f "$APP_DIR/requirements.txt" ]; then
+    echo "=== [venv] Installing from requirements.txt ==="
+    sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+fi
+
+echo "=== [venv] Done ==="
+'''
+
+                    // ── Script 4: systemd service ──────────────────────────
+                    writeFile file: 'remote-scripts/04_systemd.sh', text: '''#!/usr/bin/env bash
+set -euo pipefail
+
+: "${APP_DIR:?APP_DIR must be set}"
+: "${VENV_DIR:?VENV_DIR must be set}"
+: "${SERVICE_PORT:?SERVICE_PORT must be set}"
+: "${DEPLOY_ROOT:?DEPLOY_ROOT must be set}"
+: "${SVC_NAME:?SVC_NAME must be set}"
+: "${SVC_USER:?SVC_USER must be set}"
+: "${SVC_GROUP:?SVC_GROUP must be set}"
+
+SERVICE_FILE="/etc/systemd/system/${SVC_NAME}.service"
+
+echo "=== [systemd] Writing $SERVICE_FILE ==="
+
+# Write the unit file in parts to avoid heredoc-within-heredoc issues
+sudo tee "$SERVICE_FILE" > /dev/null << UNIT_EOF
+[Unit]
+Description=FinBERT Sentiment API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SVC_USER}
+Group=${SVC_GROUP}
+WorkingDirectory=${APP_DIR}
+Environment=PATH=${VENV_DIR}/bin
+ExecStart=${VENV_DIR}/bin/uvicorn app:app --host 0.0.0.0 --port ${SERVICE_PORT}
+Restart=on-failure
+RestartSec=5
+Environment=HF_HOME=${DEPLOY_ROOT}/.cache/huggingface
+Environment=TRANSFORMERS_CACHE=${DEPLOY_ROOT}/.cache/huggingface
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+echo "=== [systemd] Reloading daemon and enabling service ==="
+sudo systemctl daemon-reload
+sudo systemctl enable "${SVC_NAME}.service"
+
+if sudo systemctl is-active --quiet "${SVC_NAME}.service"; then
+    echo "[systemd] Restarting running service..."
+    sudo systemctl restart "${SVC_NAME}.service"
+else
+    echo "[systemd] Starting service for the first time..."
+    sudo systemctl start "${SVC_NAME}.service"
+fi
+
+echo "[systemd] Waiting 10s for service to settle..."
+sleep 10
+
+STATUS=$(sudo systemctl is-active "${SVC_NAME}.service" || true)
+echo "[systemd] Service status: $STATUS"
+
+if [ "$STATUS" != "active" ]; then
+    echo "=== ERROR: Service failed to start. Last 50 journal lines: ==="
+    sudo journalctl -u "${SVC_NAME}.service" -n 50 --no-pager
+    exit 1
+fi
+
+echo "=== [systemd] ${SVC_NAME}.service is active on port ${SERVICE_PORT} ==="
+'''
+
+                    // ── Script 5: Smoke test ───────────────────────────────
+                    writeFile file: 'remote-scripts/05_smoke.sh', text: '''#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SERVICE_PORT:?SERVICE_PORT must be set}"
+: "${SVC_NAME:?SVC_NAME must be set}"
+
+HEALTH_URL="http://127.0.0.1:${SERVICE_PORT}/health"
+echo "=== [smoke] Polling $HEALTH_URL (up to 60 s) ==="
+
+for i in $(seq 1 12); do
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || true)
+    if [ "$CODE" = "200" ]; then
+        echo "[smoke] Health check passed (HTTP 200) after $((i * 5))s."
+        exit 0
+    fi
+    echo "[smoke] Attempt $i/12 — HTTP $CODE, waiting 5s..."
+    sleep 5
+done
+
+echo "=== ERROR: /health did not return 200 within 60s ==="
+sudo journalctl -u "${SVC_NAME}.service" -n 50 --no-pager
+exit 1
+'''
+
                 }
             }
         }
 
         // ------------------------------------------------------------------ //
         stage('Bootstrap Remote: pyenv + Python 3.11') {
-        // ------------------------------------------------------------------ //
-        // Idempotent: installs build deps, pyenv, and Python 3.11 on the
-        // remote host if they are not already present.  Safe to re-run.
         // ------------------------------------------------------------------ //
             steps {
                 withCredentials([sshUserPrivateKey(
@@ -105,59 +328,17 @@ pipeline {
                 )]) {
                     sh '''
                         set -eu
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+                        echo "[jenkins] Copying bootstrap script to remote..."
+                        scp $SSH_OPTS remote-scripts/01_bootstrap.sh \
+                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_01_bootstrap.sh"
 
-                        # ── 1. System build dependencies ──────────────────────────────────
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<\'REMOTE\'
-set -eu
-
-echo "[bootstrap] Installing system build dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq \\
-    build-essential curl git \\
-    libssl-dev zlib1g-dev libbz2-dev \\
-    libreadline-dev libsqlite3-dev libncursesw5-dev \\
-    xz-utils tk-dev libxml2-dev libxmlsec1-dev \\
-    libffi-dev liblzma-dev ca-certificates
-
-# ── 2. pyenv (skip if already installed) ──────────────────────
-PYENV_ROOT="$HOME/.pyenv"
-if [ ! -d "$PYENV_ROOT" ]; then
-    echo "[bootstrap] Installing pyenv..."
-    curl -fsSL https://pyenv.run | bash
-else
-    echo "[bootstrap] pyenv already present, skipping install."
-fi
-
-# Source pyenv for this session
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init - bash)"
-
-# ── 3. Idempotent shell profile block ─────────────────────────
-PROFILE="$HOME/.bashrc"
-if ! grep -q "pyenv init" "$PROFILE"; then
-    echo "[bootstrap] Adding pyenv to $PROFILE..."
-    cat >> "$PROFILE" <<\'BLOCK\'
-
-# pyenv
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init - bash)"
-BLOCK
-fi
-
-# ── 4. Python 3.11.15 (skip if already installed) ─────────────
-if pyenv versions --bare | grep -qx "3.11.15"; then
-    echo "[bootstrap] Python 3.11.15 already installed."
-else
-    echo "[bootstrap] Installing Python 3.11.15 via pyenv (this may take a while)..."
-    pyenv install 3.11.15
-fi
-
-echo "[bootstrap] pyenv + Python 3.11.15 ready."
-REMOTE
+                        echo "[jenkins] Executing bootstrap script..."
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
+                            "chmod +x /tmp/finbert_01_bootstrap.sh && \
+                             PYENV_VERSION=$PYTHON_VERSION \
+                             bash /tmp/finbert_01_bootstrap.sh"
                     '''
                 }
             }
@@ -165,9 +346,6 @@ REMOTE
 
         // ------------------------------------------------------------------ //
         stage('Deploy: Clone / Update Repo') {
-        // ------------------------------------------------------------------ //
-        // Clones the repo on the first run; on subsequent runs it fetches and
-        // resets to the requested branch so every build is clean.
         // ------------------------------------------------------------------ //
             steps {
                 withCredentials([
@@ -184,40 +362,22 @@ REMOTE
                 ]) {
                     sh '''
                         set -eu
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+                        echo "[jenkins] Copying clone script to remote..."
+                        scp $SSH_OPTS remote-scripts/02_clone.sh \
+                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_02_clone.sh"
 
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
-set -eu
-
-DEPLOY_ROOT="$DEPLOY_REMOTE_ROOT"
-APP_DIR="$DEPLOY_APP_DIR"
-BRANCH="$GIT_BRANCH"
-# Embed credentials in the URL for non-interactive clone/fetch
-REPO_URL="https://${GIT_USER}:${GIT_TOKEN}@github.com/holofoundry/finbert-sentiment-analyser.git"
-
-# ── Ensure the root directory exists and is owned by the service user ──
-sudo mkdir -p "\$DEPLOY_ROOT"
-# Create service user if it doesn\'t exist
-if ! id "$SERVICE_USER" &>/dev/null; then
-    sudo useradd --system --home "\$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SERVICE_USER"
-fi
-sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "\$DEPLOY_ROOT"
-
-# ── Clone or update ────────────────────────────────────────────
-if [ -d "\$APP_DIR/.git" ]; then
-    echo "[deploy] Repo already cloned — fetching latest changes..."
-    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" fetch --prune origin
-    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" remote set-url origin "\$REPO_URL"
-    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" checkout "\$BRANCH"
-    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" reset --hard "origin/\$BRANCH"
-else
-    echo "[deploy] Cloning repo into \$APP_DIR..."
-    sudo -u "$SERVICE_USER" git clone --branch "\$BRANCH" "\$REPO_URL" "\$APP_DIR"
-fi
-
-echo "[deploy] Repo at branch \$BRANCH is up to date."
-REMOTE
+                        echo "[jenkins] Executing clone script..."
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
+                            "chmod +x /tmp/finbert_02_clone.sh && \
+                             DEPLOY_ROOT='$DEPLOY_REMOTE_ROOT' \
+                             APP_DIR='$DEPLOY_APP_DIR' \
+                             BRANCH='$GIT_BRANCH' \
+                             REPO_URL='https://$GIT_USER:$GIT_TOKEN@github.com/holofoundry/finbert-sentiment-analyser.git' \
+                             SVC_USER='$SERVICE_USER' \
+                             SVC_GROUP='$SERVICE_GROUP' \
+                             bash /tmp/finbert_02_clone.sh"
                     '''
                 }
             }
@@ -226,9 +386,6 @@ REMOTE
         // ------------------------------------------------------------------ //
         stage('Deploy: Virtual Environment + Dependencies') {
         // ------------------------------------------------------------------ //
-        // Creates (or reuses) the .venv and installs all Python deps.
-        // Set FORCE_REINSTALL=true to blow away and recreate the venv.
-        // ------------------------------------------------------------------ //
             steps {
                 withCredentials([sshUserPrivateKey(
                     credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
@@ -237,62 +394,21 @@ REMOTE
                 )]) {
                     sh '''
                         set -eu
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+                        echo "[jenkins] Copying venv script to remote..."
+                        scp $SSH_OPTS remote-scripts/03_venv.sh \
+                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_03_venv.sh"
 
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
-set -eu
-
-APP_DIR="$DEPLOY_APP_DIR"
-VENV_DIR="$DEPLOY_VENV_DIR"
-FORCE="$DEPLOY_FORCE_REINSTALL"
-
-# Locate the pyenv Python binary for the service user
-# (pyenv is installed into the SSH user\'s home; run as that user)
-PYENV_PYTHON="\$HOME/.pyenv/versions/$PYTHON_VERSION/bin/python3.11"
-
-if [ ! -f "\$PYENV_PYTHON" ]; then
-    echo "[venv] ERROR: Expected Python binary not found at \$PYENV_PYTHON"
-    echo "[venv] Make sure the Bootstrap stage completed successfully."
-    exit 1
-fi
-
-# ── Optionally recreate the venv ──────────────────────────────
-if [ "\$FORCE" = "true" ] && [ -d "\$VENV_DIR" ]; then
-    echo "[venv] FORCE_REINSTALL=true — removing existing venv..."
-    sudo rm -rf "\$VENV_DIR"
-fi
-
-# ── Create venv if absent ─────────────────────────────────────
-if [ ! -d "\$VENV_DIR" ]; then
-    echo "[venv] Creating virtual environment at \$VENV_DIR..."
-    sudo -u "$SERVICE_USER" "\$PYENV_PYTHON" -m venv "\$VENV_DIR"
-fi
-
-# ── Upgrade pip toolchain ─────────────────────────────────────
-echo "[venv] Upgrading pip / setuptools / wheel..."
-sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
-
-# ── Install application dependencies ─────────────────────────
-# The README/service section installs: fastapi uvicorn[standard] pydantic
-# transformers safetensors torch.  On Jetson hardware torch is pre-installed
-# with GPU support, so we install everything EXCEPT torch to avoid
-# overwriting the Jetson-optimised build.  requirements.txt also omits torch
-# for the same reason.
-echo "[venv] Installing application dependencies..."
-sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install \\
-    fastapi "uvicorn[standard]" pydantic \\
-    transformers safetensors \\
-    scikit-learn numpy pandas
-
-# Install from requirements.txt if it exists (covers any additions)
-if [ -f "\$APP_DIR/requirements.txt" ]; then
-    echo "[venv] Installing from requirements.txt..."
-    sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install -r "\$APP_DIR/requirements.txt"
-fi
-
-echo "[venv] Dependencies installed successfully."
-REMOTE
+                        echo "[jenkins] Executing venv script..."
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
+                            "chmod +x /tmp/finbert_03_venv.sh && \
+                             APP_DIR='$DEPLOY_APP_DIR' \
+                             VENV_DIR='$DEPLOY_VENV_DIR' \
+                             PYENV_VERSION='$PYTHON_VERSION' \
+                             FORCE_REINSTALL='$DEPLOY_FORCE_REINSTALL' \
+                             SVC_USER='$SERVICE_USER' \
+                             bash /tmp/finbert_03_venv.sh"
                     '''
                 }
             }
@@ -301,9 +417,6 @@ REMOTE
         // ------------------------------------------------------------------ //
         stage('Deploy: systemd Service') {
         // ------------------------------------------------------------------ //
-        // Writes /etc/systemd/system/finbert.service (matching the README
-        // template exactly) and starts/restarts the service.
-        // ------------------------------------------------------------------ //
             steps {
                 withCredentials([sshUserPrivateKey(
                     credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
@@ -312,77 +425,23 @@ REMOTE
                 )]) {
                     sh '''
                         set -eu
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+                        echo "[jenkins] Copying systemd script to remote..."
+                        scp $SSH_OPTS remote-scripts/04_systemd.sh \
+                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_04_systemd.sh"
 
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
-set -eu
-
-APP_DIR="$DEPLOY_APP_DIR"
-VENV_DIR="$DEPLOY_VENV_DIR"
-SERVICE_PORT="$DEPLOY_SERVICE_PORT"
-DEPLOY_ROOT="$DEPLOY_REMOTE_ROOT"
-
-SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
-
-echo "[systemd] Writing \$SERVICE_FILE..."
-
-sudo tee "\$SERVICE_FILE" > /dev/null <<UNIT
-[Unit]
-Description=FinBERT Sentiment API
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_GROUP
-WorkingDirectory=\$APP_DIR
-Environment=PATH=\$VENV_DIR/bin
-ExecStart=\$VENV_DIR/bin/uvicorn app:app --host 0.0.0.0 --port \$SERVICE_PORT
-Restart=on-failure
-RestartSec=5
-
-# Keep Hugging Face model cache in a predictable location
-Environment=HF_HOME=\$DEPLOY_ROOT/.cache/huggingface
-Environment=TRANSFORMERS_CACHE=\$DEPLOY_ROOT/.cache/huggingface
-UNIT
-
-cat <<INSTALL >> /tmp/finbert_install_section
-[Install]
-WantedBy=multi-user.target
-INSTALL
-
-sudo tee -a "\$SERVICE_FILE" < /tmp/finbert_install_section > /dev/null
-rm -f /tmp/finbert_install_section
-
-echo "[systemd] Reloading daemon and enabling service..."
-sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE_NAME.service"
-
-# Restart if already running; start if not
-if sudo systemctl is-active --quiet "$SERVICE_NAME.service"; then
-    echo "[systemd] Service is running — restarting to pick up new code..."
-    sudo systemctl restart "$SERVICE_NAME.service"
-else
-    echo "[systemd] Starting service for the first time..."
-    sudo systemctl start "$SERVICE_NAME.service"
-fi
-
-echo "[systemd] Waiting for service to settle (10 s)..."
-sleep 10
-
-STATUS=\$(sudo systemctl is-active "$SERVICE_NAME.service" || true)
-echo "[systemd] Service status: \$STATUS"
-
-if [ "\$STATUS" != "active" ]; then
-    echo "[systemd] ERROR: Service failed to start. Dumping last 50 log lines:"
-    sudo journalctl -u "$SERVICE_NAME.service" -n 50 --no-pager
-    exit 1
-fi
-
-echo "[systemd] $SERVICE_NAME.service is active and running on port \$SERVICE_PORT."
-REMOTE
+                        echo "[jenkins] Executing systemd script..."
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
+                            "chmod +x /tmp/finbert_04_systemd.sh && \
+                             APP_DIR='$DEPLOY_APP_DIR' \
+                             VENV_DIR='$DEPLOY_VENV_DIR' \
+                             SERVICE_PORT='$DEPLOY_SERVICE_PORT' \
+                             DEPLOY_ROOT='$DEPLOY_REMOTE_ROOT' \
+                             SVC_NAME='$SERVICE_NAME' \
+                             SVC_USER='$SERVICE_USER' \
+                             SVC_GROUP='$SERVICE_GROUP' \
+                             bash /tmp/finbert_04_systemd.sh"
                     '''
                 }
             }
@@ -391,9 +450,6 @@ REMOTE
         // ------------------------------------------------------------------ //
         stage('Smoke Test') {
         // ------------------------------------------------------------------ //
-        // Hits the /health endpoint from the remote host itself so we don\'t
-        // need to expose the port to the Jenkins controller\'s network.
-        // ------------------------------------------------------------------ //
             steps {
                 withCredentials([sshUserPrivateKey(
                     credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
@@ -402,31 +458,18 @@ REMOTE
                 )]) {
                     sh '''
                         set -eu
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+                        echo "[jenkins] Copying smoke test script to remote..."
+                        scp $SSH_OPTS remote-scripts/05_smoke.sh \
+                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_05_smoke.sh"
 
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
-set -eu
-
-SERVICE_PORT="$DEPLOY_SERVICE_PORT"
-HEALTH_URL="http://127.0.0.1:\$SERVICE_PORT/health"
-
-echo "[smoke] Polling \$HEALTH_URL (up to 60 s)..."
-
-for i in \$(seq 1 12); do
-    HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" "\$HEALTH_URL" || true)
-    if [ "\$HTTP_CODE" = "200" ]; then
-        echo "[smoke] Health check passed (HTTP \$HTTP_CODE) after \$((i * 5)) s."
-        exit 0
-    fi
-    echo "[smoke] Attempt \$i/12 — got HTTP \$HTTP_CODE, retrying in 5 s..."
-    sleep 5
-done
-
-echo "[smoke] ERROR: Health check did not return 200 within 60 s."
-sudo journalctl -u "$SERVICE_NAME.service" -n 50 --no-pager
-exit 1
-REMOTE
+                        echo "[jenkins] Running smoke test..."
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
+                            "chmod +x /tmp/finbert_05_smoke.sh && \
+                             SERVICE_PORT='$DEPLOY_SERVICE_PORT' \
+                             SVC_NAME='$SERVICE_NAME' \
+                             bash /tmp/finbert_05_smoke.sh"
                     '''
                 }
             }
@@ -446,7 +489,7 @@ REMOTE
 """
         }
         failure {
-            echo "Deployment failed. Review the stage logs above for details."
+            echo "Deployment failed. Check the stage logs above for details."
         }
     }
 }
