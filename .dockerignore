@@ -1,0 +1,17 @@
+.git
+.github
+.idea
+.vscode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.python-version
+.deploy.env
+Dockerfile
+docker-compose.pi.yml
+Jenkinsfile
+README.md

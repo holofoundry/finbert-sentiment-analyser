@@ -1,0 +1,11 @@
+# Core web server & API dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+transformers>=4.30.0
+safetensors>=0.3.1
+scikit-learn>=1.2.0
+
+# Note: torch, numpy, and pandas are intentionally omitted here.
+# They are pre-installed and optimized for NVIDIA Jetson hardware in the base image.
+# Installing them via pip might overwrite them with CPU-only wheels.

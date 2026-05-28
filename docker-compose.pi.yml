@@ -1,0 +1,24 @@
+services:
+  finbert-sentiment-analyser:
+    image: ${FINBERT_IMAGE:-ghcr.io/holofoundry/finbert-sentiment-analyser}:${FINBERT_IMAGE_TAG:-latest}
+    container_name: finbert-sentiment-analyser
+    restart: unless-stopped
+    ports:
+      - "${FINBERT_HTTP_PORT:-8081}:8000"
+    environment:
+      PORT: 8000
+      HF_HOME: /app/model_cache
+      TRANSFORMERS_CACHE: /app/model_cache
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
