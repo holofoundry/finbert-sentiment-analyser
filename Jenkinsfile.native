@@ -48,8 +48,8 @@ pipeline {
         REPOSITORY_URL = 'https://github.com/holofoundry/finbert-sentiment-analyser.git'
         PYTHON_VERSION = '3.11.15'
         SERVICE_NAME   = 'finbert'
-        SERVICE_USER   = 'finbert'
-        SERVICE_GROUP  = 'finbert'
+        SERVICE_USER   = 'david'
+        SERVICE_GROUP  = 'david'
     }
 
     stages {
@@ -151,21 +151,32 @@ set -euo pipefail
 echo "=== [clone] Ensuring deploy root $DEPLOY_ROOT exists ==="
 sudo mkdir -p "$DEPLOY_ROOT"
 
-if ! id "$SVC_USER" &>/dev/null; then
-    echo "[clone] Creating system user $SVC_USER..."
-    sudo useradd --system --home "$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SVC_USER"
+if [ "$(whoami)" != "$SVC_USER" ]; then
+    if ! id "$SVC_USER" &>/dev/null; then
+        echo "[clone] Creating system user $SVC_USER..."
+        sudo useradd --system --home "$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SVC_USER"
+    fi
 fi
 sudo chown -R "$SVC_USER":"$SVC_GROUP" "$DEPLOY_ROOT"
 
 # Write a temporary .netrc file so git can authenticate over HTTPS without credentials in the URL
 NETRC_FILE="$DEPLOY_ROOT/.netrc"
 echo "=== [clone] Writing temporary .netrc for authentication ==="
-sudo -u "$SVC_USER" tee "$NETRC_FILE" > /dev/null << NETRC_EOF
+if [ "$(whoami)" = "$SVC_USER" ]; then
+    tee "$NETRC_FILE" > /dev/null << NETRC_EOF
 machine github.com
 login x-access-token
 password $GIT_TOKEN
 NETRC_EOF
-sudo -u "$SVC_USER" chmod 600 "$NETRC_FILE"
+    chmod 600 "$NETRC_FILE"
+else
+    sudo -u "$SVC_USER" tee "$NETRC_FILE" > /dev/null << NETRC_EOF
+machine github.com
+login x-access-token
+password $GIT_TOKEN
+NETRC_EOF
+    sudo -u "$SVC_USER" chmod 600 "$NETRC_FILE"
+fi
 
 # Clean up .netrc on script exit (even on failure)
 cleanup() {
@@ -179,15 +190,23 @@ REPO_URL="https://github.com/holofoundry/finbert-sentiment-analyser.git"
 echo "=== [clone] Clone / update repo ==="
 CLEAN_BRANCH="${BRANCH#origin/}"
 
+run_as_svc_user() {
+    if [ "$(whoami)" = "$SVC_USER" ]; then
+        "$@"
+    else
+        sudo -u "$SVC_USER" "$@"
+    fi
+}
+
 if [ -d "$APP_DIR/.git" ]; then
     echo "[clone] Repo exists — fetching latest..."
-    sudo -u "$SVC_USER" git -C "$APP_DIR" remote set-url origin "$REPO_URL"
-    sudo -u "$SVC_USER" git -C "$APP_DIR" fetch --prune origin
-    sudo -u "$SVC_USER" git -C "$APP_DIR" checkout "$CLEAN_BRANCH"
-    sudo -u "$SVC_USER" git -C "$APP_DIR" reset --hard "origin/$CLEAN_BRANCH"
+    run_as_svc_user git -C "$APP_DIR" remote set-url origin "$REPO_URL"
+    run_as_svc_user git -C "$APP_DIR" fetch --prune origin
+    run_as_svc_user git -C "$APP_DIR" checkout "$CLEAN_BRANCH"
+    run_as_svc_user git -C "$APP_DIR" reset --hard "origin/$CLEAN_BRANCH"
 else
     echo "[clone] Fresh clone of branch $CLEAN_BRANCH into $APP_DIR..."
-    sudo -u "$SVC_USER" git clone --branch "$CLEAN_BRANCH" "$REPO_URL" "$APP_DIR"
+    run_as_svc_user git clone --branch "$CLEAN_BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 
 echo "=== [clone] Repo at branch $CLEAN_BRANCH is ready ==="
@@ -215,28 +234,38 @@ echo "[venv] Using: $PYENV_PYTHON"
 
 if [ "$FORCE_REINSTALL" = "true" ] && [ -d "$VENV_DIR" ]; then
     echo "[venv] FORCE_REINSTALL=true — removing $VENV_DIR..."
-    sudo rm -rf "$VENV_DIR"
+    if [ "$(whoami)" = "$SVC_USER" ]; then
+        rm -rf "$VENV_DIR"
+    else
+        sudo rm -rf "$VENV_DIR"
+    fi
 fi
+
+run_as_svc_user() {
+    if [ "$(whoami)" = "$SVC_USER" ]; then
+        "$@"
+    else
+        sudo -u "$SVC_USER" "$@"
+    fi
+}
 
 if [ ! -d "$VENV_DIR" ]; then
     echo "=== [venv] Creating virtual environment ==="
-    sudo -u "$SVC_USER" "$PYENV_PYTHON" -m venv "$VENV_DIR"
+    run_as_svc_user "$PYENV_PYTHON" -m venv "$VENV_DIR"
 fi
 
 echo "=== [venv] Upgrading pip toolchain ==="
-sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
+run_as_svc_user "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
 
 echo "=== [venv] Installing application dependencies ==="
-# torch is intentionally omitted — the Jetson has a GPU-optimised build
-# pre-installed. Installing via pip would overwrite it with a CPU-only wheel.
-sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install \
+run_as_svc_user "$VENV_DIR/bin/pip" install \
     fastapi "uvicorn[standard]" pydantic \
     transformers safetensors \
     scikit-learn numpy pandas
 
 if [ -f "$APP_DIR/requirements.txt" ]; then
     echo "=== [venv] Installing from requirements.txt ==="
-    sudo -u "$SVC_USER" "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
+    run_as_svc_user "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
 fi
 
 echo "=== [venv] Done ==="
