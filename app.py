@@ -2,6 +2,17 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Union, Dict, Any, Optional
+# Diagnostics to surface underlying import errors hidden by transformers lazy loading
+try:
+    import traceback
+    import sys
+    print("=== RUNNING PRE-FLIGHT TRANSFORMERS IMPORT DIAGNOSTIC ===", flush=True)
+    import transformers.models.auto.tokenization_auto
+    print("Pre-flight diagnostic: AutoTokenizer module loaded successfully.", flush=True)
+except Exception as e:
+    print("=== DIAGNOSTIC IMPORT EXCEPTION CAUGHT ===", flush=True)
+    traceback.print_exc(file=sys.stdout)
+    sys.stdout.flush()
 
 from sentiment_service import FinBertSentimentService
 
