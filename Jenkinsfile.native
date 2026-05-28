@@ -322,23 +322,36 @@ exit 1
         // ------------------------------------------------------------------ //
             steps {
                 script {
-                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
-                    withCredentials([sshUserPrivateKey(
-                        credentialsId: sshCredId,
-                        keyFileVariable: 'SSH_KEY',
-                        usernameVariable: 'SSH_USER'
-                    )]) {
-                        sh '''
-                            echo "[jenkins] Copying bootstrap script to remote..."
-                            scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-                                remote-scripts/01_bootstrap.sh \
-                                "$SSH_USER@$DEPLOY_HOST:/tmp/finbert_01_bootstrap.sh"
+                    try {
+                        def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                        echo "Resolved SSH credential ID: ${sshCredId}"
+                        withCredentials([sshUserPrivateKey(
+                            credentialsId: sshCredId,
+                            keyFileVariable: 'SSH_KEY',
+                            usernameVariable: 'SSH_USER'
+                        )]) {
+                            sh '''
+                                echo "[jenkins] Copying bootstrap script to remote..."
+                                scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+                                    remote-scripts/01_bootstrap.sh \
+                                    "$SSH_USER@$DEPLOY_HOST:/tmp/finbert_01_bootstrap.sh"
 
-                            echo "[jenkins] Executing bootstrap script..."
-                            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-                                "$SSH_USER@$DEPLOY_HOST" \
-                                "chmod +x /tmp/finbert_01_bootstrap.sh && PYENV_VERSION=$PYTHON_VERSION bash /tmp/finbert_01_bootstrap.sh"
-                        '''
+                                echo "[jenkins] Executing bootstrap script..."
+                                ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+                                    "$SSH_USER@$DEPLOY_HOST" \
+                                    "chmod +x /tmp/finbert_01_bootstrap.sh && PYENV_VERSION=$PYTHON_VERSION bash /tmp/finbert_01_bootstrap.sh"
+                            '''
+                        }
+                    } catch (Throwable t) {
+                        echo "=== EXCEPTION CAUGHT IN BOOTSTRAP STAGE ==="
+                        echo "Class: ${t.getClass().getName()}"
+                        echo "Message: ${t.getMessage()}"
+                        echo "String representation: ${t.toString()}"
+                        // Print stack trace elements safely
+                        t.getStackTrace().each { element ->
+                            echo "  at ${element.toString()}"
+                        }
+                        throw t
                     }
                 }
             }
