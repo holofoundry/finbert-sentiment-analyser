@@ -138,14 +138,13 @@ echo "=== [bootstrap] Complete ==="
 '''
 
                     // ── Script 2: Clone / update repo ─────────────────────
-                    // REPO_URL is injected at runtime (contains credentials)
                     writeFile file: 'remote-scripts/02_clone.sh', text: '''#!/usr/bin/env bash
 set -euo pipefail
 
 : "${DEPLOY_ROOT:?DEPLOY_ROOT must be set}"
 : "${APP_DIR:?APP_DIR must be set}"
 : "${BRANCH:?BRANCH must be set}"
-: "${REPO_URL:?REPO_URL must be set}"
+: "${GIT_TOKEN:?GIT_TOKEN must be set}"
 : "${SVC_USER:?SVC_USER must be set}"
 : "${SVC_GROUP:?SVC_GROUP must be set}"
 
@@ -157,6 +156,25 @@ if ! id "$SVC_USER" &>/dev/null; then
     sudo useradd --system --home "$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SVC_USER"
 fi
 sudo chown -R "$SVC_USER":"$SVC_GROUP" "$DEPLOY_ROOT"
+
+# Write a temporary .netrc file so git can authenticate over HTTPS without credentials in the URL
+NETRC_FILE="$DEPLOY_ROOT/.netrc"
+echo "=== [clone] Writing temporary .netrc for authentication ==="
+sudo -u "$SVC_USER" tee "$NETRC_FILE" > /dev/null << NETRC_EOF
+machine github.com
+login x-access-token
+password $GIT_TOKEN
+NETRC_EOF
+sudo -u "$SVC_USER" chmod 600 "$NETRC_FILE"
+
+# Clean up .netrc on script exit (even on failure)
+cleanup() {
+    echo "=== [clone] Cleaning up temporary .netrc ==="
+    sudo rm -f "$NETRC_FILE"
+}
+trap cleanup EXIT
+
+REPO_URL="https://github.com/holofoundry/finbert-sentiment-analyser.git"
 
 echo "=== [clone] Clone / update repo ==="
 if [ -d "$APP_DIR/.git" ]; then
@@ -385,7 +403,7 @@ exit 1
                                  DEPLOY_ROOT='$DEPLOY_PATH' \
                                  APP_DIR='$DEPLOY_PATH/finbert-sentiment-analyser' \
                                  BRANCH='$GIT_BRANCH' \
-                                 REPO_URL='https://$GIT_USER:$GIT_TOKEN@github.com/holofoundry/finbert-sentiment-analyser.git' \
+                                 GIT_TOKEN='$GIT_TOKEN' \
                                  SVC_USER='$SERVICE_USER' \
                                  SVC_GROUP='$SERVICE_GROUP' \
                                  bash /tmp/finbert_02_clone.sh"
