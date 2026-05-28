@@ -14,6 +14,7 @@ pipeline {
         string(name: 'IMAGE_NAME', defaultValue: 'ghcr.io/holofoundry/finbert-sentiment-analyser', description: 'GHCR image name to build and deploy.')
         string(name: 'TARGET_PLATFORM', defaultValue: 'linux/arm64', description: 'Docker platform to build.')
         string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'jetson-deployment-key', description: 'Jenkins SSH private key credential used to deploy to the webserver.')
+        string(name: 'HF_TOKEN_CREDENTIAL_ID', defaultValue: 'huggingface-token', description: 'Jenkins Secret Text credential ID for Hugging Face API Token (optional).')
     }
 
     environment {
@@ -53,32 +54,53 @@ FINBERT_HTTP_PORT=8081
 
         stage('Build and Push Image') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: "${env.DEPLOY_GITHUB_CREDENTIALS_ID}",
-                    usernameVariable: 'GHCR_USER',
-                    passwordVariable: 'GHCR_TOKEN'
-                )]) {
-                    sh '''
-                        set -eu
-                        printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+                script {
+                    def credentials = [
+                        usernamePassword(
+                            credentialsId: "${env.DEPLOY_GITHUB_CREDENTIALS_ID}",
+                            usernameVariable: 'GHCR_USER',
+                            passwordVariable: 'GHCR_TOKEN'
+                        )
+                    ]
+                    
+                    if (params.HF_TOKEN_CREDENTIAL_ID?.trim()) {
+                        credentials.add(string(
+                            credentialsId: params.HF_TOKEN_CREDENTIAL_ID.trim(),
+                            variable: 'HF_TOKEN'
+                        ))
+                    }
+                    
+                    withCredentials(credentials) {
+                        sh '''
+                            set -eu
+                            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-                        if docker buildx version >/dev/null 2>&1; then
-                            docker buildx create --use --name finbert-builder 2>/dev/null || docker buildx use finbert-builder
-                            docker buildx build \
-                                --platform "$DEPLOY_TARGET_PLATFORM" \
-                                --file Dockerfile \
-                                --tag "$DEPLOY_IMAGE_NAME:latest" \
-                                --push \
-                                .
-                        else
-                            docker build --pull \
-                                --platform "$DEPLOY_TARGET_PLATFORM" \
-                                --file Dockerfile \
-                                --tag "$DEPLOY_IMAGE_NAME:latest" \
-                                .
-                            docker push "$DEPLOY_IMAGE_NAME:latest"
-                        fi
-                    '''
+                            # Set build args
+                            BUILD_ARGS=""
+                            if [ -n "${HF_TOKEN:-}" ]; then
+                                BUILD_ARGS="--build-arg HF_TOKEN=$HF_TOKEN"
+                            fi
+
+                            if docker buildx version >/dev/null 2>&1; then
+                                docker buildx create --use --name finbert-builder 2>/dev/null || docker buildx use finbert-builder
+                                docker buildx build \
+                                    --platform "$DEPLOY_TARGET_PLATFORM" \
+                                    --file Dockerfile \
+                                    $BUILD_ARGS \
+                                    --tag "$DEPLOY_IMAGE_NAME:latest" \
+                                    --push \
+                                    .
+                            else
+                                docker build --pull \
+                                    --platform "$DEPLOY_TARGET_PLATFORM" \
+                                    --file Dockerfile \
+                                    $BUILD_ARGS \
+                                    --tag "$DEPLOY_IMAGE_NAME:latest" \
+                                    .
+                                docker push "$DEPLOY_IMAGE_NAME:latest"
+                            fi
+                        '''
+                    }
                 }
             }
         }
