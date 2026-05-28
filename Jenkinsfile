@@ -13,7 +13,7 @@ pipeline {
         string(name: 'DEPLOY_PATH', defaultValue: '/opt/finbert', description: 'Deployment directory on the remote host.')
         string(name: 'IMAGE_NAME', defaultValue: 'ghcr.io/holofoundry/finbert-sentiment-analyser', description: 'GHCR image name to build and deploy.')
         string(name: 'TARGET_PLATFORM', defaultValue: 'linux/arm64', description: 'Docker platform to build.')
-        string(name: 'SSH_CREDENTIALS_ID', defaultValue: '1d7fca85-f028-47e9-8fb2-b4e81978c67a', description: 'Jenkins SSH private key credential used to deploy to the webserver.')
+        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'jetson-deployment-key', description: 'Jenkins SSH private key credential used to deploy to the webserver.')
     }
 
     environment {
@@ -41,7 +41,7 @@ pipeline {
                     env.DEPLOY_IMAGE_NAME = params.IMAGE_NAME?.trim() ?: 'ghcr.io/holofoundry/finbert-sentiment-analyser'
                     env.DEPLOY_TARGET_PLATFORM = params.TARGET_PLATFORM?.trim() ?: 'linux/arm64'
                     env.DEPLOY_IMAGE_TAG = 'latest'
-                    env.DEPLOY_SSH_CREDENTIALS_ID = params.SSH_CREDENTIALS_ID?.trim() ?: '1d7fca85-f028-47e9-8fb2-b4e81978c67a'
+                    env.DEPLOY_SSH_CREDENTIALS_ID = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
 
                     writeFile file: '.deploy.env', text: """FINBERT_IMAGE=${env.DEPLOY_IMAGE_NAME}
 FINBERT_IMAGE_TAG=${env.DEPLOY_IMAGE_TAG}
