@@ -29,7 +29,7 @@ pipeline {
         )
         string(
             name: 'SSH_CREDENTIALS_ID',
-            defaultValue: 'jetson-deployment-key',
+            defaultValue: 'jenkins-deployment-key',
             description: 'Jenkins SSH private key credential used to connect to the remote server.'
         )
         string(

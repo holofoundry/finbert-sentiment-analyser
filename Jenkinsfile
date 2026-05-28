@@ -13,7 +13,7 @@ pipeline {
         string(name: 'DEPLOY_PATH', defaultValue: '/opt/finbert', description: 'Deployment directory on the remote host.')
         string(name: 'IMAGE_NAME', defaultValue: 'ghcr.io/holofoundry/finbert-sentiment-analyser', description: 'GHCR image name to build and deploy.')
         string(name: 'TARGET_PLATFORM', defaultValue: 'linux/arm64', description: 'Docker platform to build.')
-        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'jetson-deployment-key', description: 'Jenkins SSH private key credential used to deploy to the webserver.')
+        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'jenkins-deployment-key', description: 'Jenkins SSH private key credential used to deploy to the webserver.')
         string(name: 'HF_TOKEN_CREDENTIAL_ID', defaultValue: 'huggingface-token', description: 'Jenkins Secret Text credential ID for Hugging Face API Token (optional).')
     }
 
