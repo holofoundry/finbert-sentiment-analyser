@@ -22,8 +22,8 @@ ENV HF_HOME=/app/model_cache \
     PYTHONUNBUFFERED=1
 
 # Pre-download and cache ProsusAI/finbert model weights and tokenizer during build.
-# This avoids downloading the model at runtime/startup, saving time and ensuring offline reliability.
-RUN python3 -c 'from transformers import AutoTokenizer, AutoModelForSequenceClassification; AutoTokenizer.from_pretrained("ProsusAI/finbert"); AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")'
+# We use huggingface_hub directly to avoid importing PyTorch/CUDA during docker build (which fails due to missing runtime GPU drivers).
+RUN python3 -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id="ProsusAI/finbert")'
 
 # Copy application files
 COPY app.py sentiment_service.py ./
