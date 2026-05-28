@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-# Default to NVIDIA L4T PyTorch image for Jetson Orin Nano (JetPack 6.0 / L4T r36.2)
-ARG BASE_IMAGE=nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.2-py3
+# Default to official NVIDIA PyTorch container with iGPU support for JetPack 6.2
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.09-py3-igpu
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
