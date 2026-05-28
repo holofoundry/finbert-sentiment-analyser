@@ -1,0 +1,452 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    parameters {
+        string(
+            name: 'GIT_BRANCH',
+            defaultValue: 'main',
+            description: 'Git branch to deploy.'
+        )
+        string(
+            name: 'GITHUB_CREDENTIALS_ID',
+            defaultValue: 'github-pat-token',
+            description: 'Jenkins username/password GitHub PAT credential used for repo checkout.'
+        )
+        string(
+            name: 'DEPLOY_HOST',
+            defaultValue: '100.102.25.32',
+            description: 'SSH host for the Jetson Orin Nano server.'
+        )
+        string(
+            name: 'DEPLOY_PATH',
+            defaultValue: '/opt/finbert',
+            description: 'Root deployment directory on the remote host. The repo is cloned into DEPLOY_PATH/finbert-sentiment-analyser.'
+        )
+        string(
+            name: 'SSH_CREDENTIALS_ID',
+            defaultValue: 'jetson-deployment-key',
+            description: 'Jenkins SSH private key credential used to connect to the remote server.'
+        )
+        string(
+            name: 'SERVICE_PORT',
+            defaultValue: '8000',
+            description: 'Port that uvicorn will bind to on the remote host.'
+        )
+        booleanParam(
+            name: 'FORCE_REINSTALL',
+            defaultValue: false,
+            description: 'When true, deletes and recreates the virtual environment from scratch.'
+        )
+    }
+
+    environment {
+        REPOSITORY_URL  = 'https://github.com/holofoundry/finbert-sentiment-analyser.git'
+        PYTHON_VERSION  = '3.11.15'
+        SERVICE_NAME    = 'finbert'
+        SERVICE_USER    = 'finbert'
+        SERVICE_GROUP   = 'finbert'
+    }
+
+    stages {
+
+        // ------------------------------------------------------------------ //
+        stage('Checkout') {
+        // ------------------------------------------------------------------ //
+        // Pull the source locally so we can validate the branch exists and
+        // copy any local-only config artefacts to the server if needed in
+        // future stages.
+        // ------------------------------------------------------------------ //
+            steps {
+                script {
+                    env.DEPLOY_GITHUB_CREDENTIALS_ID = params.GITHUB_CREDENTIALS_ID?.trim() ?: 'github-pat-token'
+                }
+                deleteDir()
+                git branch: "${params.GIT_BRANCH}",
+                    credentialsId: "${env.DEPLOY_GITHUB_CREDENTIALS_ID}",
+                    url: "${env.REPOSITORY_URL}"
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Prepare') {
+        // ------------------------------------------------------------------ //
+        // Resolve all parameters into environment variables used by later
+        // stages so every shell block reads from a single source of truth.
+        // ------------------------------------------------------------------ //
+            steps {
+                script {
+                    env.DEPLOY_WEB_HOST        = params.DEPLOY_HOST?.trim()     ?: '100.102.25.32'
+                    env.DEPLOY_REMOTE_ROOT     = params.DEPLOY_PATH?.trim()     ?: '/opt/finbert'
+                    env.DEPLOY_SSH_CREDS_ID    = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    env.DEPLOY_SERVICE_PORT    = params.SERVICE_PORT?.trim()    ?: '8000'
+                    env.DEPLOY_APP_DIR         = "${env.DEPLOY_REMOTE_ROOT}/finbert-sentiment-analyser"
+                    env.DEPLOY_VENV_DIR        = "${env.DEPLOY_APP_DIR}/.venv"
+                    env.DEPLOY_FORCE_REINSTALL = params.FORCE_REINSTALL ? 'true' : 'false'
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Bootstrap Remote: pyenv + Python 3.11') {
+        // ------------------------------------------------------------------ //
+        // Idempotent: installs build deps, pyenv, and Python 3.11 on the
+        // remote host if they are not already present.  Safe to re-run.
+        // ------------------------------------------------------------------ //
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh '''
+                        set -eu
+
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+                        # ── 1. System build dependencies ──────────────────────────────────
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<\'REMOTE\'
+set -eu
+
+echo "[bootstrap] Installing system build dependencies..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq \\
+    build-essential curl git \\
+    libssl-dev zlib1g-dev libbz2-dev \\
+    libreadline-dev libsqlite3-dev libncursesw5-dev \\
+    xz-utils tk-dev libxml2-dev libxmlsec1-dev \\
+    libffi-dev liblzma-dev ca-certificates
+
+# ── 2. pyenv (skip if already installed) ──────────────────────
+PYENV_ROOT="$HOME/.pyenv"
+if [ ! -d "$PYENV_ROOT" ]; then
+    echo "[bootstrap] Installing pyenv..."
+    curl -fsSL https://pyenv.run | bash
+else
+    echo "[bootstrap] pyenv already present, skipping install."
+fi
+
+# Source pyenv for this session
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - bash)"
+
+# ── 3. Idempotent shell profile block ─────────────────────────
+PROFILE="$HOME/.bashrc"
+if ! grep -q "pyenv init" "$PROFILE"; then
+    echo "[bootstrap] Adding pyenv to $PROFILE..."
+    cat >> "$PROFILE" <<\'BLOCK\'
+
+# pyenv
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - bash)"
+BLOCK
+fi
+
+# ── 4. Python 3.11.15 (skip if already installed) ─────────────
+if pyenv versions --bare | grep -qx "3.11.15"; then
+    echo "[bootstrap] Python 3.11.15 already installed."
+else
+    echo "[bootstrap] Installing Python 3.11.15 via pyenv (this may take a while)..."
+    pyenv install 3.11.15
+fi
+
+echo "[bootstrap] pyenv + Python 3.11.15 ready."
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Deploy: Clone / Update Repo') {
+        // ------------------------------------------------------------------ //
+        // Clones the repo on the first run; on subsequent runs it fetches and
+        // resets to the requested branch so every build is clean.
+        // ------------------------------------------------------------------ //
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    ),
+                    usernamePassword(
+                        credentialsId: "${env.DEPLOY_GITHUB_CREDENTIALS_ID}",
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
+set -eu
+
+DEPLOY_ROOT="$DEPLOY_REMOTE_ROOT"
+APP_DIR="$DEPLOY_APP_DIR"
+BRANCH="$GIT_BRANCH"
+# Embed credentials in the URL for non-interactive clone/fetch
+REPO_URL="https://${GIT_USER}:${GIT_TOKEN}@github.com/holofoundry/finbert-sentiment-analyser.git"
+
+# ── Ensure the root directory exists and is owned by the service user ──
+sudo mkdir -p "\$DEPLOY_ROOT"
+# Create service user if it doesn\'t exist
+if ! id "$SERVICE_USER" &>/dev/null; then
+    sudo useradd --system --home "\$DEPLOY_ROOT" --shell /usr/sbin/nologin "$SERVICE_USER"
+fi
+sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "\$DEPLOY_ROOT"
+
+# ── Clone or update ────────────────────────────────────────────
+if [ -d "\$APP_DIR/.git" ]; then
+    echo "[deploy] Repo already cloned — fetching latest changes..."
+    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" fetch --prune origin
+    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" remote set-url origin "\$REPO_URL"
+    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" checkout "\$BRANCH"
+    sudo -u "$SERVICE_USER" git -C "\$APP_DIR" reset --hard "origin/\$BRANCH"
+else
+    echo "[deploy] Cloning repo into \$APP_DIR..."
+    sudo -u "$SERVICE_USER" git clone --branch "\$BRANCH" "\$REPO_URL" "\$APP_DIR"
+fi
+
+echo "[deploy] Repo at branch \$BRANCH is up to date."
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Deploy: Virtual Environment + Dependencies') {
+        // ------------------------------------------------------------------ //
+        // Creates (or reuses) the .venv and installs all Python deps.
+        // Set FORCE_REINSTALL=true to blow away and recreate the venv.
+        // ------------------------------------------------------------------ //
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh '''
+                        set -eu
+
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
+set -eu
+
+APP_DIR="$DEPLOY_APP_DIR"
+VENV_DIR="$DEPLOY_VENV_DIR"
+FORCE="$DEPLOY_FORCE_REINSTALL"
+
+# Locate the pyenv Python binary for the service user
+# (pyenv is installed into the SSH user\'s home; run as that user)
+PYENV_PYTHON="\$HOME/.pyenv/versions/$PYTHON_VERSION/bin/python3.11"
+
+if [ ! -f "\$PYENV_PYTHON" ]; then
+    echo "[venv] ERROR: Expected Python binary not found at \$PYENV_PYTHON"
+    echo "[venv] Make sure the Bootstrap stage completed successfully."
+    exit 1
+fi
+
+# ── Optionally recreate the venv ──────────────────────────────
+if [ "\$FORCE" = "true" ] && [ -d "\$VENV_DIR" ]; then
+    echo "[venv] FORCE_REINSTALL=true — removing existing venv..."
+    sudo rm -rf "\$VENV_DIR"
+fi
+
+# ── Create venv if absent ─────────────────────────────────────
+if [ ! -d "\$VENV_DIR" ]; then
+    echo "[venv] Creating virtual environment at \$VENV_DIR..."
+    sudo -u "$SERVICE_USER" "\$PYENV_PYTHON" -m venv "\$VENV_DIR"
+fi
+
+# ── Upgrade pip toolchain ─────────────────────────────────────
+echo "[venv] Upgrading pip / setuptools / wheel..."
+sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
+
+# ── Install application dependencies ─────────────────────────
+# The README/service section installs: fastapi uvicorn[standard] pydantic
+# transformers safetensors torch.  On Jetson hardware torch is pre-installed
+# with GPU support, so we install everything EXCEPT torch to avoid
+# overwriting the Jetson-optimised build.  requirements.txt also omits torch
+# for the same reason.
+echo "[venv] Installing application dependencies..."
+sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install \\
+    fastapi "uvicorn[standard]" pydantic \\
+    transformers safetensors \\
+    scikit-learn numpy pandas
+
+# Install from requirements.txt if it exists (covers any additions)
+if [ -f "\$APP_DIR/requirements.txt" ]; then
+    echo "[venv] Installing from requirements.txt..."
+    sudo -u "$SERVICE_USER" "\$VENV_DIR/bin/pip" install -r "\$APP_DIR/requirements.txt"
+fi
+
+echo "[venv] Dependencies installed successfully."
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Deploy: systemd Service') {
+        // ------------------------------------------------------------------ //
+        // Writes /etc/systemd/system/finbert.service (matching the README
+        // template exactly) and starts/restarts the service.
+        // ------------------------------------------------------------------ //
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh '''
+                        set -eu
+
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
+set -eu
+
+APP_DIR="$DEPLOY_APP_DIR"
+VENV_DIR="$DEPLOY_VENV_DIR"
+SERVICE_PORT="$DEPLOY_SERVICE_PORT"
+DEPLOY_ROOT="$DEPLOY_REMOTE_ROOT"
+
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+
+echo "[systemd] Writing \$SERVICE_FILE..."
+
+sudo tee "\$SERVICE_FILE" > /dev/null <<UNIT
+[Unit]
+Description=FinBERT Sentiment API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
+WorkingDirectory=\$APP_DIR
+Environment=PATH=\$VENV_DIR/bin
+ExecStart=\$VENV_DIR/bin/uvicorn app:app --host 0.0.0.0 --port \$SERVICE_PORT
+Restart=on-failure
+RestartSec=5
+
+# Keep Hugging Face model cache in a predictable location
+Environment=HF_HOME=\$DEPLOY_ROOT/.cache/huggingface
+Environment=TRANSFORMERS_CACHE=\$DEPLOY_ROOT/.cache/huggingface
+UNIT
+
+cat <<INSTALL >> /tmp/finbert_install_section
+[Install]
+WantedBy=multi-user.target
+INSTALL
+
+sudo tee -a "\$SERVICE_FILE" < /tmp/finbert_install_section > /dev/null
+rm -f /tmp/finbert_install_section
+
+echo "[systemd] Reloading daemon and enabling service..."
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE_NAME.service"
+
+# Restart if already running; start if not
+if sudo systemctl is-active --quiet "$SERVICE_NAME.service"; then
+    echo "[systemd] Service is running — restarting to pick up new code..."
+    sudo systemctl restart "$SERVICE_NAME.service"
+else
+    echo "[systemd] Starting service for the first time..."
+    sudo systemctl start "$SERVICE_NAME.service"
+fi
+
+echo "[systemd] Waiting for service to settle (10 s)..."
+sleep 10
+
+STATUS=\$(sudo systemctl is-active "$SERVICE_NAME.service" || true)
+echo "[systemd] Service status: \$STATUS"
+
+if [ "\$STATUS" != "active" ]; then
+    echo "[systemd] ERROR: Service failed to start. Dumping last 50 log lines:"
+    sudo journalctl -u "$SERVICE_NAME.service" -n 50 --no-pager
+    exit 1
+fi
+
+echo "[systemd] $SERVICE_NAME.service is active and running on port \$SERVICE_PORT."
+REMOTE
+                    '''
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ //
+        stage('Smoke Test') {
+        // ------------------------------------------------------------------ //
+        // Hits the /health endpoint from the remote host itself so we don\'t
+        // need to expose the port to the Jenkins controller\'s network.
+        // ------------------------------------------------------------------ //
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh '''
+                        set -eu
+
+                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" bash -s <<REMOTE
+set -eu
+
+SERVICE_PORT="$DEPLOY_SERVICE_PORT"
+HEALTH_URL="http://127.0.0.1:\$SERVICE_PORT/health"
+
+echo "[smoke] Polling \$HEALTH_URL (up to 60 s)..."
+
+for i in \$(seq 1 12); do
+    HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" "\$HEALTH_URL" || true)
+    if [ "\$HTTP_CODE" = "200" ]; then
+        echo "[smoke] Health check passed (HTTP \$HTTP_CODE) after \$((i * 5)) s."
+        exit 0
+    fi
+    echo "[smoke] Attempt \$i/12 — got HTTP \$HTTP_CODE, retrying in 5 s..."
+    sleep 5
+done
+
+echo "[smoke] ERROR: Health check did not return 200 within 60 s."
+sudo journalctl -u "$SERVICE_NAME.service" -n 50 --no-pager
+exit 1
+REMOTE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+=======================================================
+  FinBERT native deployment completed successfully.
+  Host   : ${env.DEPLOY_WEB_HOST}
+  AppDir : ${env.DEPLOY_APP_DIR}
+  Port   : ${env.DEPLOY_SERVICE_PORT}
+  Service: ${env.SERVICE_NAME}.service (systemd)
+=======================================================
+"""
+        }
+        failure {
+            echo "Deployment failed. Review the stage logs above for details."
+        }
+    }
+}
