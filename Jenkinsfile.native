@@ -177,18 +177,20 @@ trap cleanup EXIT
 REPO_URL="https://github.com/holofoundry/finbert-sentiment-analyser.git"
 
 echo "=== [clone] Clone / update repo ==="
+CLEAN_BRANCH="${BRANCH#origin/}"
+
 if [ -d "$APP_DIR/.git" ]; then
     echo "[clone] Repo exists — fetching latest..."
     sudo -u "$SVC_USER" git -C "$APP_DIR" remote set-url origin "$REPO_URL"
     sudo -u "$SVC_USER" git -C "$APP_DIR" fetch --prune origin
-    sudo -u "$SVC_USER" git -C "$APP_DIR" checkout "$BRANCH"
-    sudo -u "$SVC_USER" git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+    sudo -u "$SVC_USER" git -C "$APP_DIR" checkout "$CLEAN_BRANCH"
+    sudo -u "$SVC_USER" git -C "$APP_DIR" reset --hard "origin/$CLEAN_BRANCH"
 else
-    echo "[clone] Fresh clone into $APP_DIR..."
-    sudo -u "$SVC_USER" git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+    echo "[clone] Fresh clone of branch $CLEAN_BRANCH into $APP_DIR..."
+    sudo -u "$SVC_USER" git clone --branch "$CLEAN_BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 
-echo "=== [clone] Repo at branch $BRANCH is ready ==="
+echo "=== [clone] Repo at branch $CLEAN_BRANCH is ready ==="
 '''
 
                     // ── Script 3: Virtual environment + dependencies ───────
