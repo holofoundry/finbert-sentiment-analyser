@@ -261,7 +261,7 @@ echo "=== [venv] Installing application dependencies ==="
 run_as_svc_user "$VENV_DIR/bin/pip" install \
     fastapi "uvicorn[standard]" pydantic \
     transformers safetensors \
-    scikit-learn numpy pandas
+    scikit-learn numpy pandas torch
 
 if [ -f "$APP_DIR/requirements.txt" ]; then
     echo "=== [venv] Installing from requirements.txt ==="
