@@ -347,10 +347,6 @@ exit 1
                         echo "Class: ${t.getClass().getName()}"
                         echo "Message: ${t.getMessage()}"
                         echo "String representation: ${t.toString()}"
-                        // Print stack trace elements safely
-                        t.getStackTrace().each { element ->
-                            echo "  at ${element.toString()}"
-                        }
                         throw t
                     }
                 }
