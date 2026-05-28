@@ -28,7 +28,7 @@ ARG HF_TOKEN
 
 # Pre-download and cache ProsusAI/finbert model weights and tokenizer during build.
 # We use huggingface_hub directly to avoid importing PyTorch/CUDA during docker build (which fails due to missing runtime GPU drivers).
-RUN HF_TOKEN=${HF_TOKEN} python3 -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id="ProsusAI/finbert", disable_tqdm=True)'
+RUN HF_TOKEN=${HF_TOKEN} python3 -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id="ProsusAI/finbert")'
 
 # Copy application files
 COPY app.py sentiment_service.py ./
