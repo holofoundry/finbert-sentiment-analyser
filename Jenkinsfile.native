@@ -321,25 +321,27 @@ exit 1
         stage('Bootstrap Remote: pyenv + Python 3.11') {
         // ------------------------------------------------------------------ //
             steps {
-                withCredentials([sshUserPrivateKey(
-                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
-                    keyFileVariable: 'SSH_KEY',
-                    usernameVariable: 'SSH_USER'
-                )]) {
-                    sh '''
-                        set -eu
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
+                script {
+                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    def deployHost = params.DEPLOY_HOST?.trim() ?: '100.102.25.32'
+                    
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: sshCredId,
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )]) {
+                        sh """
+                            echo "[jenkins] Copying bootstrap script to remote..."
+                            scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                remote-scripts/01_bootstrap.sh \
+                                "\$SSH_USER@${deployHost}:/tmp/finbert_01_bootstrap.sh"
 
-                        echo "[jenkins] Copying bootstrap script to remote..."
-                        scp $SSH_OPTS remote-scripts/01_bootstrap.sh \
-                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_01_bootstrap.sh"
-
-                        echo "[jenkins] Executing bootstrap script..."
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
-                            "chmod +x /tmp/finbert_01_bootstrap.sh && \
-                             PYENV_VERSION=$PYTHON_VERSION \
-                             bash /tmp/finbert_01_bootstrap.sh"
-                    '''
+                            echo "[jenkins] Executing bootstrap script..."
+                            ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                "\$SSH_USER@${deployHost}" \
+                                "chmod +x /tmp/finbert_01_bootstrap.sh && PYENV_VERSION=${env.PYTHON_VERSION} bash /tmp/finbert_01_bootstrap.sh"
+                        """
+                    }
                 }
             }
         }
@@ -348,37 +350,45 @@ exit 1
         stage('Deploy: Clone / Update Repo') {
         // ------------------------------------------------------------------ //
             steps {
-                withCredentials([
-                    sshUserPrivateKey(
-                        credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
-                        keyFileVariable: 'SSH_KEY',
-                        usernameVariable: 'SSH_USER'
-                    ),
-                    usernamePassword(
-                        credentialsId: "${env.DEPLOY_GITHUB_CREDENTIALS_ID}",
-                        usernameVariable: 'GIT_USER',
-                        passwordVariable: 'GIT_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
+                script {
+                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    def githubCredId = params.GITHUB_CREDENTIALS_ID?.trim() ?: 'github-pat-token'
+                    def deployHost = params.DEPLOY_HOST?.trim() ?: '100.102.25.32'
+                    def deployPath = params.DEPLOY_PATH?.trim() ?: '/opt/finbert'
+                    def gitBranch = params.GIT_BRANCH?.trim() ?: 'main'
+                    def appDir = "${deployPath}/finbert-sentiment-analyser"
 
-                        echo "[jenkins] Copying clone script to remote..."
-                        scp $SSH_OPTS remote-scripts/02_clone.sh \
-                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_02_clone.sh"
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: sshCredId,
+                            keyFileVariable: 'SSH_KEY',
+                            usernameVariable: 'SSH_USER'
+                        ),
+                        usernamePassword(
+                            credentialsId: githubCredId,
+                            usernameVariable: 'GIT_USER',
+                            passwordVariable: 'GIT_TOKEN'
+                        )
+                    ]) {
+                        sh """
+                            echo "[jenkins] Copying clone script to remote..."
+                            scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                remote-scripts/02_clone.sh \
+                                "\$SSH_USER@${deployHost}:/tmp/finbert_02_clone.sh"
 
-                        echo "[jenkins] Executing clone script..."
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
-                            "chmod +x /tmp/finbert_02_clone.sh && \
-                             DEPLOY_ROOT='$DEPLOY_REMOTE_ROOT' \
-                             APP_DIR='$DEPLOY_APP_DIR' \
-                             BRANCH='$GIT_BRANCH' \
-                             REPO_URL='https://$GIT_USER:$GIT_TOKEN@github.com/holofoundry/finbert-sentiment-analyser.git' \
-                             SVC_USER='$SERVICE_USER' \
-                             SVC_GROUP='$SERVICE_GROUP' \
-                             bash /tmp/finbert_02_clone.sh"
-                    '''
+                            echo "[jenkins] Executing clone script..."
+                            ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                "\$SSH_USER@${deployHost}" \
+                                "chmod +x /tmp/finbert_02_clone.sh && \\
+                                 DEPLOY_ROOT='${deployPath}' \\
+                                 APP_DIR='${appDir}' \\
+                                 BRANCH='${gitBranch}' \\
+                                 REPO_URL='https://\$GIT_USER:\$GIT_TOKEN@github.com/holofoundry/finbert-sentiment-analyser.git' \\
+                                 SVC_USER='${env.SERVICE_USER}' \\
+                                 SVC_GROUP='${env.SERVICE_GROUP}' \\
+                                 bash /tmp/finbert_02_clone.sh"
+                        """
+                    }
                 }
             }
         }
@@ -387,29 +397,37 @@ exit 1
         stage('Deploy: Virtual Environment + Dependencies') {
         // ------------------------------------------------------------------ //
             steps {
-                withCredentials([sshUserPrivateKey(
-                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
-                    keyFileVariable: 'SSH_KEY',
-                    usernameVariable: 'SSH_USER'
-                )]) {
-                    sh '''
-                        set -eu
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
+                script {
+                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    def deployHost = params.DEPLOY_HOST?.trim() ?: '100.102.25.32'
+                    def deployPath = params.DEPLOY_PATH?.trim() ?: '/opt/finbert'
+                    def appDir = "${deployPath}/finbert-sentiment-analyser"
+                    def venvDir = "${appDir}/.venv"
+                    def forceReinstall = params.FORCE_REINSTALL ? 'true' : 'false'
 
-                        echo "[jenkins] Copying venv script to remote..."
-                        scp $SSH_OPTS remote-scripts/03_venv.sh \
-                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_03_venv.sh"
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: sshCredId,
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )]) {
+                        sh """
+                            echo "[jenkins] Copying venv script to remote..."
+                            scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                remote-scripts/03_venv.sh \
+                                "\$SSH_USER@${deployHost}:/tmp/finbert_03_venv.sh"
 
-                        echo "[jenkins] Executing venv script..."
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
-                            "chmod +x /tmp/finbert_03_venv.sh && \
-                             APP_DIR='$DEPLOY_APP_DIR' \
-                             VENV_DIR='$DEPLOY_VENV_DIR' \
-                             PYENV_VERSION='$PYTHON_VERSION' \
-                             FORCE_REINSTALL='$DEPLOY_FORCE_REINSTALL' \
-                             SVC_USER='$SERVICE_USER' \
-                             bash /tmp/finbert_03_venv.sh"
-                    '''
+                            echo "[jenkins] Executing venv script..."
+                            ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                "\$SSH_USER@${deployHost}" \
+                                "chmod +x /tmp/finbert_03_venv.sh && \\
+                                 APP_DIR='${appDir}' \\
+                                 VENV_DIR='${venvDir}' \\
+                                 PYENV_VERSION='${env.PYTHON_VERSION}' \\
+                                 FORCE_REINSTALL='${forceReinstall}' \\
+                                 SVC_USER='${env.SERVICE_USER}' \\
+                                 bash /tmp/finbert_03_venv.sh"
+                        """
+                    }
                 }
             }
         }
@@ -418,31 +436,39 @@ exit 1
         stage('Deploy: systemd Service') {
         // ------------------------------------------------------------------ //
             steps {
-                withCredentials([sshUserPrivateKey(
-                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
-                    keyFileVariable: 'SSH_KEY',
-                    usernameVariable: 'SSH_USER'
-                )]) {
-                    sh '''
-                        set -eu
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
+                script {
+                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    def deployHost = params.DEPLOY_HOST?.trim() ?: '100.102.25.32'
+                    def deployPath = params.DEPLOY_PATH?.trim() ?: '/opt/finbert'
+                    def appDir = "${deployPath}/finbert-sentiment-analyser"
+                    def venvDir = "${appDir}/.venv"
+                    def servicePort = params.SERVICE_PORT?.trim() ?: '8000'
 
-                        echo "[jenkins] Copying systemd script to remote..."
-                        scp $SSH_OPTS remote-scripts/04_systemd.sh \
-                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_04_systemd.sh"
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: sshCredId,
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )]) {
+                        sh """
+                            echo "[jenkins] Copying systemd script to remote..."
+                            scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                remote-scripts/04_systemd.sh \
+                                "\$SSH_USER@${deployHost}:/tmp/finbert_04_systemd.sh"
 
-                        echo "[jenkins] Executing systemd script..."
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
-                            "chmod +x /tmp/finbert_04_systemd.sh && \
-                             APP_DIR='$DEPLOY_APP_DIR' \
-                             VENV_DIR='$DEPLOY_VENV_DIR' \
-                             SERVICE_PORT='$DEPLOY_SERVICE_PORT' \
-                             DEPLOY_ROOT='$DEPLOY_REMOTE_ROOT' \
-                             SVC_NAME='$SERVICE_NAME' \
-                             SVC_USER='$SERVICE_USER' \
-                             SVC_GROUP='$SERVICE_GROUP' \
-                             bash /tmp/finbert_04_systemd.sh"
-                    '''
+                            echo "[jenkins] Executing systemd script..."
+                            ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                "\$SSH_USER@${deployHost}" \
+                                "chmod +x /tmp/finbert_04_systemd.sh && \\
+                                 APP_DIR='${appDir}' \\
+                                 VENV_DIR='${venvDir}' \\
+                                 SERVICE_PORT='${servicePort}' \\
+                                 DEPLOY_ROOT='${deployPath}' \\
+                                 SVC_NAME='${env.SERVICE_NAME}' \\
+                                 SVC_USER='${env.SERVICE_USER}' \\
+                                 SVC_GROUP='${env.SERVICE_GROUP}' \\
+                                 bash /tmp/finbert_04_systemd.sh"
+                        """
+                    }
                 }
             }
         }
@@ -451,26 +477,31 @@ exit 1
         stage('Smoke Test') {
         // ------------------------------------------------------------------ //
             steps {
-                withCredentials([sshUserPrivateKey(
-                    credentialsId: "${env.DEPLOY_SSH_CREDS_ID}",
-                    keyFileVariable: 'SSH_KEY',
-                    usernameVariable: 'SSH_USER'
-                )]) {
-                    sh '''
-                        set -eu
-                        SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
+                script {
+                    def sshCredId = params.SSH_CREDENTIALS_ID?.trim() ?: 'jetson-deployment-key'
+                    def deployHost = params.DEPLOY_HOST?.trim() ?: '100.102.25.32'
+                    def servicePort = params.SERVICE_PORT?.trim() ?: '8000'
 
-                        echo "[jenkins] Copying smoke test script to remote..."
-                        scp $SSH_OPTS remote-scripts/05_smoke.sh \
-                            "$SSH_USER@$DEPLOY_WEB_HOST:/tmp/finbert_05_smoke.sh"
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: sshCredId,
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )]) {
+                        sh """
+                            echo "[jenkins] Copying smoke test script to remote..."
+                            scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                remote-scripts/05_smoke.sh \
+                                "\$SSH_USER@${deployHost}:/tmp/finbert_05_smoke.sh"
 
-                        echo "[jenkins] Running smoke test..."
-                        ssh $SSH_OPTS "$SSH_USER@$DEPLOY_WEB_HOST" \
-                            "chmod +x /tmp/finbert_05_smoke.sh && \
-                             SERVICE_PORT='$DEPLOY_SERVICE_PORT' \
-                             SVC_NAME='$SERVICE_NAME' \
-                             bash /tmp/finbert_05_smoke.sh"
-                    '''
+                            echo "[jenkins] Running smoke test..."
+                            ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
+                                "\$SSH_USER@${deployHost}" \
+                                "chmod +x /tmp/finbert_05_smoke.sh && \\
+                                 SERVICE_PORT='${servicePort}' \\
+                                 SVC_NAME='${env.SERVICE_NAME}' \\
+                                 bash /tmp/finbert_05_smoke.sh"
+                        """
+                    }
                 }
             }
         }
